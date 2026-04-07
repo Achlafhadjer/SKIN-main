@@ -40,7 +40,7 @@ CFG = _load_training_config()
 # 1️⃣ Dataset Hugging Face
 # -------------------------------
 _hf_id = CFG.get("dataset", {}).get("huggingface_id", "ahmed-ai/skin-lesions-classification-dataset")
-ds = load_dataset(_hf_id)
+ds = load_dataset("ahmed-ai/skin-lesions-classification-dataset")
 print(ds)
 
 val_key = "validation" if "validation" in ds else "test"
