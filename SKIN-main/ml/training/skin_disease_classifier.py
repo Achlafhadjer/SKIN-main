@@ -15,8 +15,56 @@ layers = tf.keras.layers
 models = tf.keras.models
 EarlyStopping = tf.keras.callbacks.EarlyStopping
 ModelCheckpoint = tf.keras.callbacks.ModelCheckpoint
+ReduceLROnPlateau = tf.keras.callbacks.ReduceLROnPlateau
 MobileNetV2 = tf.keras.applications.MobileNetV2
 
+# ============================================
+# 0️⃣ VÉRIFICATION ET CONFIGURATION GPU
+# ============================================
+print("=" * 60)
+print("CONFIGURATION GPU")
+print("=" * 60)
+
+# Vérifier les GPUs disponibles
+gpus = tf.config.list_physical_devices('GPU')
+print(f"GPUs détectés: {gpus}")
+
+if gpus:
+    try:
+        # Configurer la croissance de mémoire GPU pour éviter l'épuisement
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        
+        # Définir le GPU par défaut (prendre le premier)
+        tf.config.set_visible_devices(gpus[0], 'GPU')
+        print(f"✅ GPU configuré: {gpus[0]}")
+        
+        # Afficher les détails du GPU
+        if tf.config.experimental.get_device_details(gpus[0]):
+            details = tf.config.experimental.get_device_details(gpus[0])
+            print(f"   - Nom: {details.get('device_name', 'Inconnu')}")
+            print(f"   - Compute Capability: {details.get('compute_capability', 'Inconnu')}")
+        
+        # Forcer TensorFlow à utiliser le GPU
+        with tf.device('/GPU:0'):
+            test_tensor = tf.constant([[1.0, 2.0], [3.0, 4.0]])
+            print(f"   - Test tensor: {test_tensor.device}")
+        
+    except RuntimeError as e:
+        print(f"⚠️ Erreur configuration GPU: {e}")
+else:
+    print("⚠️ Aucun GPU détecté, utilisation CPU")
+
+# Stratégie de distribution (optionnel pour multi-GPU)
+if len(gpus) > 1:
+    strategy = tf.distribute.MirroredStrategy()
+    print(f"✅ Stratégie multi-GPU activée avec {strategy.num_replicas_in_sync} GPUs")
+else:
+    strategy = tf.distribute.get_strategy()
+    print(f"✅ Stratégie par défaut: {strategy.__class__.__name__}")
+
+print("=" * 60)
+print()
 
 ARTIFACTS_DIR = Path(__file__).resolve().parent / "training_artifacts"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,8 +82,6 @@ def _load_training_config() -> dict:
 CFG = _load_training_config()
 
 # -------------------------------
-
-
 
 # 1️⃣ Dataset Hugging Face
 # -------------------------------
@@ -72,6 +118,10 @@ AUTOTUNE = tf.data.AUTOTUNE
 use_imagenet_preprocess = bool(_prep.get("use_imagenet_preprocess", True))
 use_class_weights = bool(_tr.get("use_class_weights", True))
 
+# Optimisations GPU
+batch_size = batch_size * strategy.num_replicas_in_sync
+print(f"Batch size ajusté pour GPU: {batch_size}")
+
 # Export pour aligner server.py / inférence
 _names_json = json.dumps(class_names, ensure_ascii=False, indent=2)
 (ARTIFACTS_DIR / "class_names.json").write_text(_names_json, encoding="utf-8")
@@ -81,7 +131,7 @@ Path(__file__).resolve().parent.joinpath("class_names.json").write_text(
 )
 
 # -------------------------------
-# 3️⃣ tf.data depuis HF (sparse labels + loss sparse_categorical_crossentropy)
+# 3️⃣ tf.data depuis HF (optimisé GPU)
 # -------------------------------
 def _preprocess_image_for_model(x: np.ndarray) -> np.ndarray:
     # MobileNetV2 expects inputs in [-1, 1] when using imagenet weights.
@@ -110,7 +160,13 @@ def make_tf_dataset(split: str, shuffle: bool) -> tf.data.Dataset:
     td = tf.data.Dataset.from_generator(generator, output_signature=sig)
     if shuffle:
         td = td.shuffle(min(10_000, n), reshuffle_each_iteration=True)
-    return td.batch(batch_size).prefetch(AUTOTUNE)
+    
+    # Optimisations GPU
+    td = td.batch(batch_size)
+    td = td.prefetch(AUTOTUNE)
+    td = td.cache() if not shuffle else td  # Cache pour validation
+    
+    return td
 
 
 train_dataset = make_tf_dataset("train", shuffle=True)
@@ -153,7 +209,7 @@ def save_class_distribution_artifacts() -> tuple[Path, Path]:
     return json_path, plot_path
 
 # -------------------------------
-# 4️⃣ Augmentation + MobileNetV2 (transfer learning)
+# 4️⃣ Construction du modèle avec stratégie GPU
 # -------------------------------
 _flip = _aug.get("random_flip", "horizontal")
 data_augmentation = tf.keras.Sequential(
@@ -167,68 +223,88 @@ data_augmentation = tf.keras.Sequential(
     name="data_augmentation",
 )
 
-base_model = MobileNetV2(
-    weights=imagenet_weights,
-    include_top=False,
-    input_shape=(img_height, img_width, 3),
-)
-base_model.trainable = False
+# Construire le modèle dans la stratégie de distribution
+with strategy.scope():
+    base_model = MobileNetV2(
+        weights=imagenet_weights,
+        include_top=False,
+        input_shape=(img_height, img_width, 3),
+    )
+    base_model.trainable = False
 
-inputs = layers.Input(shape=(img_height, img_width, 3))
-x = data_augmentation(inputs)
-x = base_model(x, training=False)
-x = layers.GlobalAveragePooling2D()(x)
-x = layers.Dense(dense_units, activation=str(_mod.get("top_activation", "relu")))(x)
-outputs = layers.Dense(num_classes, activation="softmax")(x)
+    inputs = layers.Input(shape=(img_height, img_width, 3))
+    x = data_augmentation(inputs)
+    x = base_model(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(dense_units, activation=str(_mod.get("top_activation", "relu")))(x)
+    x = layers.Dropout(float(_mod.get("dropout_rate", 0.3)))(x)  # Ajout dropout
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
 
-model = models.Model(inputs, outputs)
+    model = models.Model(inputs, outputs)
 
-model.compile(
-    optimizer="adam",
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"],
-)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=float(_tr.get("learning_rate", 1e-3))),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
 
+# Callbacks optimisés
 callbacks = [
-    EarlyStopping(monitor="val_loss", patience=es_patience, restore_best_weights=True),
+    EarlyStopping(monitor="val_loss", patience=es_patience, restore_best_weights=True, verbose=1),
     ModelCheckpoint(
         filepath=str(ARTIFACTS_DIR / "skin_model_best.h5"),
         monitor="val_loss",
         save_best_only=True,
+        verbose=1,
+    ),
+    ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-7,
+        verbose=1
     ),
 ]
 
 # -------------------------------
-# 5️⃣ Entraînement — phase 1 (tête seule)
+# 5️⃣ Entraînement — phase 1 (tête seule) AVEC VERBOSE
 # -------------------------------
-history = None
+print("\n" + "=" * 60)
+print("PHASE 1: ENTRAÎNEMENT DE LA TÊTE")
+print("=" * 60)
+
 history = model.fit(
     train_dataset,
     validation_data=val_dataset,
     epochs=epochs_head,
     callbacks=callbacks,
     class_weight=class_weights,
+    verbose=1  # ✅ VERBOSE ACTIVÉ - montre chaque étape
 )
 
 # -------------------------------
 # 6️⃣ Fine-tuning
 # -------------------------------
-base_model.trainable = True
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(ft_lr),
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"],
-)
+print("\n" + "=" * 60)
+print("PHASE 2: FINE-TUNING")
+print("=" * 60)
 
-history_ft = None
+with strategy.scope():
+    base_model.trainable = True
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(ft_lr),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
 history_ft = model.fit(
     train_dataset,
     validation_data=val_dataset,
     epochs=epochs_finetune,
     callbacks=callbacks,
     class_weight=class_weights,
+    verbose=1  # ✅ VERBOSE ACTIVÉ
 )
-
 
 # -------------------------------
 # 7️⃣ Courbes loss / accuracy
@@ -244,16 +320,16 @@ def plot_training_curves(h1: tf.keras.callbacks.History, h2: tf.keras.callbacks.
     epochs_range = range(1, len(loss) + 1)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(epochs_range, loss, label="train loss")
-    axes[0].plot(epochs_range, val_loss, label="val loss")
+    axes[0].plot(epochs_range, loss, label="train loss", linewidth=2)
+    axes[0].plot(epochs_range, val_loss, label="val loss", linewidth=2)
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
     axes[0].legend()
     axes[0].set_title("Loss (transfert + fine-tuning)")
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(epochs_range, acc, label="train acc")
-    axes[1].plot(epochs_range, val_acc, label="val acc")
+    axes[1].plot(epochs_range, acc, label="train acc", linewidth=2)
+    axes[1].plot(epochs_range, val_acc, label="val acc", linewidth=2)
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy")
     axes[1].legend()
@@ -262,7 +338,7 @@ def plot_training_curves(h1: tf.keras.callbacks.History, h2: tf.keras.callbacks.
 
     fig.tight_layout()
     out = ARTIFACTS_DIR / "training_curves.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out
 
@@ -317,9 +393,16 @@ if history is not None and history_ft is not None:
     curves_path = plot_training_curves(history, history_ft)
     print(f"Courbes sauvegardées : {curves_path}")
 
+# Évaluation finale
+print("\n" + "=" * 60)
+print("ÉVALUATION FINALE DU MODÈLE")
+print("=" * 60)
+
+# Collecter prédictions
 y_true, y_pred = collect_predictions(model, val_dataset)
 cm = confusion_matrix(y_true, y_pred, labels=np.arange(num_classes))
 
+# Rapport de classification
 report_txt = classification_report(
     y_true,
     y_pred,
@@ -330,6 +413,7 @@ report_path = ARTIFACTS_DIR / "classification_report.txt"
 report_path.write_text(report_txt, encoding="utf-8")
 print(report_txt)
 
+# Sauvegarder visualisations
 cm_path = plot_confusion(cm, class_names)
 print(f"Matrice de confusion : {cm_path}")
 print(f"Rapport P/R/F1 : {report_path}")
@@ -345,8 +429,7 @@ model.save(str(final_path))
 print(f"✅ Modèle final : {final_path}")
 print(f"✅ Noms de classes : {ARTIFACTS_DIR / 'class_names.json'}")
 
-# Export additionnel .pth (artifact exigé parfois par certains cahiers de charge)
-# Note: il s'agit d'un checkpoint sérialisé de poids Keras (pas un state_dict PyTorch direct).
+# Export additionnel .pth
 pth_path = ARTIFACTS_DIR / "skin_model_best.pth"
 keras_weights = [w.numpy() for w in model.weights]
 pth_payload = {
@@ -360,7 +443,7 @@ with open(pth_path, "wb") as f:
     pickle.dump(pth_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 print(f"✅ Artifact .pth généré : {pth_path}")
 
-# Rapport markdown prêt à coller dans le rapport PDF
+# Rapport markdown
 report_md = ARTIFACTS_DIR / "report_results.md"
 report_md.write_text(
     "\n".join(
@@ -386,3 +469,12 @@ report_md.write_text(
     encoding="utf-8",
 )
 print(f"✅ Résumé rapport généré : {report_md}")
+
+# Information GPU utilisée
+print("\n" + "=" * 60)
+print("INFORMATIONS FINALES")
+print("=" * 60)
+print(f"GPU utilisé: {gpus[0] if gpus else 'CPU'}")
+print(f"Batch size effectif: {batch_size}")
+print(f"Stratégie: {strategy.__class__.__name__}")
+print("=" * 60)
