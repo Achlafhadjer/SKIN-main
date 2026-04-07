@@ -1,0 +1,27 @@
+# Hyperparamètres et options du mini-projet Deep Learning (modifiables sans toucher au code).
+dataset:
+  huggingface_id: ahmed-ai/skin-lesions-classification-dataset
+
+image:
+  height: 224
+  width: 224
+
+training:
+  batch_size: 32
+  epochs_head: 15
+  epochs_finetune: 5
+  fine_tune_learning_rate: 1.0e-5
+  early_stopping_patience: 5
+
+model:
+  backbone: MobileNetV2
+  imagenet_weights: imagenet
+  dense_units: 128
+  top_activation: relu
+
+augmentation:
+  random_flip: horizontal
+  random_rotation: 0.1
+  random_zoom: 0.1
+  random_height: 0.1
+  random_width: 0.1
