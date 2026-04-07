@@ -86,7 +86,7 @@ Path(__file__).resolve().parent.joinpath("class_names.json").write_text(
 def _preprocess_image_for_model(x: np.ndarray) -> np.ndarray:
     # MobileNetV2 expects inputs in [-1, 1] when using imagenet weights.
     if use_imagenet_preprocess:
-        return tf.keras.applications.mobilenet_v2.preprocess_input(x).numpy()
+        return tf.keras.applications.mobilenet_v2.preprocess_input(x)
     return x / 255.0
 
 
